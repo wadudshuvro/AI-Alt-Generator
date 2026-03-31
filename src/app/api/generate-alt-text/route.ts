@@ -1,40 +1,421 @@
 import { NextRequest, NextResponse } from "next/server";
 
+const MAX_ALT_LENGTH = 99;
+const MAX_IMAGES = 12;
+/** Per-image cap for base64 payload */
+const MAX_IMAGE_DATA_URL_LENGTH = 8_000_000;
+const MAX_FETCH_IMAGE_BYTES = 6 * 1024 * 1024;
+
+/** Allow any image/* MIME; base64 marker case-insensitive for browser quirks */
+const DATA_IMAGE_URL_RE = /^data:image\/.+;base64,/i;
+
+const SYSTEM_PROMPT =
+  "You are an accessibility expert. For each image, write concise ALT text (max 99 characters) suitable for HTML img alt. Do not say 'image' or 'picture'—describe the content. Follow the user's instructions about order, style, or language if they ask.";
+
+function normalizeSources(body: Record<string, unknown>): {
+  sources: string[];
+  fallbacks: string[];
+} | null {
+  const fromData = (arr: unknown): string[] | null => {
+    if (!Array.isArray(arr)) return null;
+    const out: string[] = [];
+    for (const item of arr) {
+      if (typeof item !== "string" || !item.trim()) return null;
+      const s = item.trim();
+      if (s.length > MAX_IMAGE_DATA_URL_LENGTH) return null;
+      if (!DATA_IMAGE_URL_RE.test(s) && !/^https?:\/\//i.test(s)) return null;
+      try {
+        if (!s.startsWith("data:")) new URL(s);
+      } catch {
+        return null;
+      }
+      out.push(s);
+    }
+    return out.length ? out : null;
+  };
+
+  let sources: string[] | null = null;
+
+  if (Array.isArray(body.imageDataUrls) && body.imageDataUrls.length > 0) {
+    const onlyData = body.imageDataUrls.every(
+      (x) => typeof x === "string" && DATA_IMAGE_URL_RE.test(x.trim())
+    );
+    if (onlyData) sources = fromData(body.imageDataUrls);
+  }
+  if (!sources && typeof body.imageDataUrl === "string" && body.imageDataUrl.trim()) {
+    sources = fromData([body.imageDataUrl.trim()]);
+  }
+  if (!sources && Array.isArray(body.imageUrls) && body.imageUrls.length > 0) {
+    sources = fromData(body.imageUrls);
+  }
+  if (!sources && typeof body.imageUrl === "string" && body.imageUrl.trim()) {
+    sources = fromData([body.imageUrl.trim()]);
+  }
+
+  if (!sources?.length) return null;
+  if (sources.length > MAX_IMAGES) return null;
+
+  const fallbacks = sources.map((src, i) => {
+    if (src.startsWith("data:")) return `Pasted or uploaded image ${i + 1}.`;
+    try {
+      const url = new URL(src);
+      const pathname = url.pathname || "";
+      const filename = pathname.split("/").filter(Boolean).pop() || "image";
+      const nameWithoutExt = filename
+        .replace(/\.[^.]+$/, "")
+        .replace(/[-_]/g, " ")
+        .trim();
+      return nameWithoutExt.length > 1
+        ? `Image: ${nameWithoutExt}`.slice(0, MAX_ALT_LENGTH)
+        : `Image ${i + 1} from URL.`.slice(0, MAX_ALT_LENGTH);
+    } catch {
+      return `Image ${i + 1}.`;
+    }
+  });
+
+  return { sources, fallbacks };
+}
+
+function parseModelOutputToLines(text: string, n: number): string[] {
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) =>
+      l
+        .replace(/^\s*(\d+[\).\]]|[-*•]|[A-Za-z][\).\]]\s*)\s*/, "")
+        .trim()
+    )
+    .filter(Boolean);
+
+  const alts: string[] = [];
+  for (let i = 0; i < n; i++) {
+    let line = lines[i] ?? "";
+    if (line.length > MAX_ALT_LENGTH) line = line.slice(0, MAX_ALT_LENGTH);
+    alts.push(line);
+  }
+  return alts;
+}
+
+function parseDataImageUrl(dataUrl: string): { mimeType: string; base64: string } | null {
+  const idx = dataUrl.indexOf(";base64,");
+  if (idx === -1) return null;
+  const meta = dataUrl.slice(5, idx);
+  if (!meta.toLowerCase().startsWith("image/")) return null;
+  const mimeType = meta.split(";")[0].trim();
+  const base64 = dataUrl.slice(idx + ";base64,".length);
+  if (!mimeType || !base64) return null;
+  return { mimeType, base64 };
+}
+
+/** Gemini REST uses snake_case for Part.inline_data (see AI Studio curl examples). */
+async function sourceToGeminiImagePart(
+  source: string
+): Promise<{ inline_data: { mime_type: string; data: string } } | null> {
+  if (source.startsWith("data:")) {
+    const parsed = parseDataImageUrl(source);
+    if (!parsed) return null;
+    return {
+      inline_data: { mime_type: parsed.mimeType, data: parsed.base64 },
+    };
+  }
+  try {
+    const url = new URL(source);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    const res = await fetch(url.toString(), { redirect: "follow" });
+    if (!res.ok) return null;
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength > MAX_FETCH_IMAGE_BYTES) return null;
+    const ct = res.headers.get("content-type")?.split(";")[0]?.trim() || "image/jpeg";
+    if (!ct.startsWith("image/")) return null;
+    const data = Buffer.from(buf).toString("base64");
+    return { inline_data: { mime_type: ct, data } };
+  } catch {
+    return null;
+  }
+}
+
+/** Tried in order so a 429 on one model can succeed on another (separate quotas). */
+const GEMINI_MODEL_FALLBACKS = [
+  "gemini-2.5-flash-lite",
+  "gemini-2.0-flash-lite",
+  "gemini-1.5-flash",
+  "gemini-2.0-flash",
+] as const;
+
+function geminiModelsToTry(): string[] {
+  const preferred = process.env.GEMINI_MODEL?.trim();
+  const ordered = preferred
+    ? [preferred, ...GEMINI_MODEL_FALLBACKS]
+    : [...GEMINI_MODEL_FALLBACKS];
+  return [...new Set(ordered)];
+}
+
+type GeminiJson = {
+  candidates?: Array<{
+    content?: { parts?: Array<{ text?: string }> };
+    finishReason?: string;
+  }>;
+  promptFeedback?: { blockReason?: string };
+  error?: { code?: number; message?: string; status?: string };
+};
+
+async function generateAltsWithGemini(
+  sources: string[],
+  userPrompt: string,
+  apiKey: string
+): Promise<{ alts: string[] | null; hint?: string }> {
+  const n = sources.length;
+
+  const instruction =
+    userPrompt.trim() ||
+    "Generate accessible ALT text for each image in the order they appear (first attachment = first line).";
+  const outputRule = `\n\nOutput exactly ${n} lines. Each line is ONLY the alt text for that image (max ${MAX_ALT_LENGTH} characters). No numbering, bullets, or labels—one alt per line, in order.`;
+
+  const parts: Array<
+    { text: string } | { inline_data: { mime_type: string; data: string } }
+  > = [{ text: instruction + outputRule }];
+
+  for (const src of sources) {
+    const imagePart = await sourceToGeminiImagePart(src);
+    if (!imagePart) {
+      return { alts: null, hint: "Could not read an image for Gemini (invalid or too large)." };
+    }
+    parts.push(imagePart);
+  }
+
+  const body = JSON.stringify({
+    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+    contents: [{ role: "user", parts }],
+    generationConfig: {
+      maxOutputTokens: Math.min(1024, 100 + n * 60),
+      temperature: 0.3,
+    },
+  });
+
+  let lastHint =
+    "Gemini did not return usable text. Check Google AI Studio quotas or set GEMINI_MODEL in .env.local.";
+
+  for (const model of geminiModelsToTry()) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+
+    const raw = await response.text();
+    let json: GeminiJson;
+    try {
+      json = JSON.parse(raw) as GeminiJson;
+    } catch {
+      console.error("Gemini non-JSON response", model, raw.slice(0, 500));
+      lastHint = `Gemini (${model}) returned an invalid response.`;
+      continue;
+    }
+
+    if (!response.ok) {
+      const code = json.error?.code;
+      const msg = json.error?.message ?? raw;
+      console.error("Gemini API error", model, raw);
+      if (code === 429) {
+        lastHint =
+          "Gemini free-tier quota or rate limit hit (429). This app retries other models automatically; if all fail, wait ~1 minute or set billing / another project in Google AI Studio. See https://ai.google.dev/gemini-api/docs/rate-limits";
+      } else if (code === 403) {
+        lastHint =
+          "Gemini returned 403 (API not enabled for this key or region). Enable Generative Language API in Google Cloud for the key’s project.";
+      } else if (code === 400 || code === 404) {
+        lastHint = `Gemini model “${model}” failed (${code}). Try GEMINI_MODEL=gemini-1.5-flash in .env.local. ${msg.slice(0, 180)}`;
+      } else {
+        lastHint = msg.slice(0, 280);
+      }
+      continue;
+    }
+
+    const block = json.promptFeedback?.blockReason;
+    if (block) {
+      lastHint = `Gemini blocked the request (${block}). Try a different image or prompt.`;
+      continue;
+    }
+
+    const c0 = json.candidates?.[0];
+    const textParts = c0?.content?.parts;
+    if (!textParts?.length) {
+      lastHint = `Gemini (${model}) returned no candidates (finish: ${c0?.finishReason ?? "unknown"}).`;
+      continue;
+    }
+
+    const text = textParts
+      .map((p) => (typeof p.text === "string" ? p.text : ""))
+      .join("\n")
+      .trim();
+
+    if (!text) {
+      lastHint = `Gemini (${model}) returned empty text.`;
+      continue;
+    }
+
+    const alts = parseModelOutputToLines(text, n);
+    return { alts };
+  }
+
+  return { alts: null, hint: lastHint };
+}
+
+async function generateAltsWithOpenAI(
+  sources: string[],
+  userPrompt: string
+): Promise<string[] | null> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return null;
+
+  const n = sources.length;
+  const instruction =
+    userPrompt.trim() ||
+    "Generate accessible ALT text for each image in the order they appear (first attachment = first line).";
+  const outputRule = `\n\nOutput exactly ${n} lines. Each line is ONLY the alt text for that image (max ${MAX_ALT_LENGTH} characters). No numbering, bullets, or labels—one alt per line, in order.`;
+
+  const userContent: Array<
+    | { type: "text"; text: string }
+    | { type: "image_url"; image_url: { url: string } }
+  > = [{ type: "text", text: instruction + outputRule }];
+
+  for (const url of sources) {
+    userContent.push({ type: "image_url", image_url: { url } });
+  }
+
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: userContent },
+      ],
+      max_tokens: Math.min(800, 80 + n * 50),
+    }),
+  });
+
+  if (!response.ok) {
+    console.error("OpenAI API error", await response.text());
+    return null;
+  }
+
+  const json = await response.json();
+  const content = json.choices?.[0]?.message?.content;
+  if (!content) return null;
+
+  let text: string;
+  if (typeof content === "string") {
+    text = content.trim();
+  } else if (Array.isArray(content)) {
+    text = content
+      .map((part: { text?: string }) => (typeof part?.text === "string" ? part.text : ""))
+      .join("\n")
+      .trim();
+  } else {
+    return null;
+  }
+
+  return parseModelOutputToLines(text, n);
+}
+
+function googleApiKey(): string | undefined {
+  const k =
+    process.env.GOOGLE_AI_API_KEY?.trim() ||
+    process.env.GEMINI_API_KEY?.trim();
+  return k || undefined;
+}
+
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json();
-    const imageUrl = body?.imageUrl;
+    const body = (await request.json()) as Record<string, unknown>;
+    const prompt = typeof body.prompt === "string" ? body.prompt : "";
 
-    if (!imageUrl || typeof imageUrl !== "string") {
+    const parsed = normalizeSources(body);
+    if (!parsed) {
       return NextResponse.json(
-        { error: "Missing or invalid imageUrl." },
+        {
+          error: `Add at least one image (paste, file, or URL). Maximum ${MAX_IMAGES} images.`,
+        },
         { status: 400 }
       );
     }
 
-    // Validate URL format
-    let url: URL;
+    const { sources, fallbacks } = parsed;
+
+    const geminiKey = googleApiKey();
+    const openaiKey = process.env.OPENAI_API_KEY?.trim();
+    const hasAnyKey = Boolean(geminiKey || openaiKey);
+
+    let usedAi = false;
+    let provider: "gemini" | "openai" | null = null;
+    let altTexts: string[] = [...fallbacks];
+    let geminiFailureHint: string | undefined;
+
+    const applyAi = (ai: string[] | null, p: "gemini" | "openai") => {
+      if (ai && ai.length === sources.length) {
+        usedAi = true;
+        provider = p;
+        altTexts = ai.map((t, i) => {
+          const trimmed = (t || "").trim();
+          if (!trimmed) return fallbacks[i];
+          return trimmed.length > MAX_ALT_LENGTH
+            ? trimmed.slice(0, MAX_ALT_LENGTH)
+            : trimmed;
+        });
+      }
+    };
+
     try {
-      url = new URL(imageUrl);
-    } catch {
-      return NextResponse.json(
-        { error: "Invalid image URL format." },
-        { status: 400 }
-      );
+      if (geminiKey) {
+        const { alts, hint: gh } = await generateAltsWithGemini(
+          sources,
+          prompt,
+          geminiKey
+        );
+        applyAi(alts, "gemini");
+        if (!usedAi && gh) geminiFailureHint = gh;
+      }
+      if (!usedAi && openaiKey) {
+        const ai = await generateAltsWithOpenAI(sources, prompt);
+        applyAi(ai, "openai");
+      }
+    } catch (err) {
+      console.error("Error calling vision API:", err);
     }
 
-    // Placeholder: generate simple alt text from URL (e.g. filename).
-    // Replace this with your preferred AI/vision API (e.g. OpenAI GPT-4 Vision).
-    const pathname = url.pathname || "";
-    const filename = pathname.split("/").filter(Boolean).pop() || "image";
-    const nameWithoutExt = filename.replace(/\.[^.]+$/, "").replace(/[-_]/g, " ");
-    const altText =
-      nameWithoutExt.length > 1
-        ? `Image: ${nameWithoutExt}`
-        : "Image from provided URL.";
+    for (let i = 0; i < altTexts.length; i++) {
+      if (altTexts[i].length > MAX_ALT_LENGTH) {
+        altTexts[i] = altTexts[i].slice(0, MAX_ALT_LENGTH);
+      }
+    }
 
-    return NextResponse.json({ altText });
-  } catch {
+    const altText = altTexts.length === 1 ? altTexts[0] : altTexts.join("\n");
+
+    const hint = usedAi
+      ? undefined
+      : !hasAnyKey
+        ? "Vision AI is off: add GOOGLE_AI_API_KEY (Google AI Studio / Gemini) or OPENAI_API_KEY to .env.local, then restart npm run dev."
+        : geminiFailureHint ??
+          "The model did not return usable lines (check the key, API enablement, billing, and server logs). Showing placeholder text only.";
+
+    return NextResponse.json({
+      altTexts,
+      altText,
+      maxLength: MAX_ALT_LENGTH,
+      count: altTexts.length,
+      usedAi,
+      provider,
+      /** True when a vision model produced the alts (Gemini or OpenAI). */
+      usedOpenAI: usedAi,
+      hint,
+    });
+  } catch (error) {
+    console.error("Unhandled error in /api/generate-alt-text:", error);
     return NextResponse.json(
       { error: "Failed to process request." },
       { status: 500 }
