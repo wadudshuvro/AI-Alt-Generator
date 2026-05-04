@@ -10,7 +10,7 @@ const MAX_FETCH_IMAGE_BYTES = 6 * 1024 * 1024;
 const DATA_IMAGE_URL_RE = /^data:image\/.+;base64,/i;
 
 const SYSTEM_PROMPT =
-  "You are an accessibility expert. For each image, write concise ALT text (max 99 characters) suitable for HTML img alt. Do not say 'image' or 'picture'—describe the content. Follow the user's instructions about order, style, or language if they ask.";
+  "You write product-image ALT text for HTML img attributes (max 99 characters each). Describe only what is visible: brand, color, product type, key feature, context. Never use phrases like 'image of', 'picture of', or 'text in this image'. No promotional hype or keyword stuffing. Natural sentence case; do not use symbols such as | / _. Shorten if over 99 characters. Output only the alt text content. Follow the user's prompt for order (e.g. one line per image in sequence).";
 
 function normalizeSources(body: Record<string, unknown>): {
   sources: string[];
