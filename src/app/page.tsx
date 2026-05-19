@@ -1,9 +1,11 @@
 "use client";
 
-import { useCallback, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 
 const MAX_PASTE_BYTES = 4 * 1024 * 1024;
 const MAX_IMAGES = 12;
+const STORAGE_GOOGLE_KEY = "alt-text-google-api-key";
+const STORAGE_OPENAI_KEY = "alt-text-openai-api-key";
 
 type PastedImage = {
   id: string;
@@ -54,6 +56,34 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [isDragging, setIsDragging] = useState(false);
+  const [googleApiKey, setGoogleApiKey] = useState("");
+  const [openaiApiKey, setOpenaiApiKey] = useState("");
+  const [showApiSettings, setShowApiSettings] = useState(true);
+  const [keysHydrated, setKeysHydrated] = useState(false);
+
+  useEffect(() => {
+    setGoogleApiKey(localStorage.getItem(STORAGE_GOOGLE_KEY) ?? "");
+    setOpenaiApiKey(localStorage.getItem(STORAGE_OPENAI_KEY) ?? "");
+    setKeysHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    if (!keysHydrated) return;
+    if (googleApiKey.trim()) {
+      localStorage.setItem(STORAGE_GOOGLE_KEY, googleApiKey.trim());
+    } else {
+      localStorage.removeItem(STORAGE_GOOGLE_KEY);
+    }
+  }, [googleApiKey, keysHydrated]);
+
+  useEffect(() => {
+    if (!keysHydrated) return;
+    if (openaiApiKey.trim()) {
+      localStorage.setItem(STORAGE_OPENAI_KEY, openaiApiKey.trim());
+    } else {
+      localStorage.removeItem(STORAGE_OPENAI_KEY);
+    }
+  }, [openaiApiKey, keysHydrated]);
 
   const revokePreview = useCallback((item: PastedImage) => {
     if (item.previewUrl.startsWith("blob:")) URL.revokeObjectURL(item.previewUrl);
@@ -166,6 +196,8 @@ export default function Home() {
         body: JSON.stringify({
           imageDataUrls: images.map((x) => x.dataUrl),
           prompt: prompt.trim(),
+          ...(googleApiKey.trim() ? { googleApiKey: googleApiKey.trim() } : {}),
+          ...(openaiApiKey.trim() ? { openaiApiKey: openaiApiKey.trim() } : {}),
         }),
       });
       const data = await res.json();
@@ -179,7 +211,16 @@ export default function Home() {
           ? data.altText.split(/\r?\n/).filter(Boolean)
           : [];
       setAltTexts(list);
-      if (typeof data.hint === "string" && data.hint) setApiHint(data.hint);
+      if (typeof data.hint === "string" && data.hint) {
+        const parts: string[] = [];
+        if (data.geminiKeySource === "request" && data.geminiKeySuffix) {
+          parts.push(`Using your pasted Google key (…${data.geminiKeySuffix}).`);
+        } else if (data.geminiKeySource === "env") {
+          parts.push("Using Google key from .env.local.");
+        }
+        parts.push(data.hint);
+        setApiHint(parts.join(" "));
+      }
     } catch {
       setError("Something went wrong. Please try again.");
     } finally {
@@ -205,18 +246,73 @@ export default function Home() {
               Paste images, write a short prompt, then generate accessible descriptions for each image.
             </p>
           </div>
-          <p className="max-w-md text-xs leading-relaxed text-zinc-600 lg:text-right">
-            Add{" "}
-            <code className="rounded bg-zinc-800/90 px-1.5 py-0.5 font-mono text-[11px] text-zinc-300">
-              GOOGLE_AI_API_KEY
-            </code>{" "}
-            or{" "}
-            <code className="rounded bg-zinc-800/90 px-1.5 py-0.5 font-mono text-[11px] text-zinc-300">
-              OPENAI_API_KEY
-            </code>{" "}
-            in <code className="font-mono text-zinc-500">.env.local</code>. See{" "}
-            <code className="font-mono text-zinc-500">.env.example</code>.
-          </p>
+          <div className="w-full max-w-md lg:max-w-sm">
+            <button
+              type="button"
+              onClick={() => setShowApiSettings((v) => !v)}
+              className="flex w-full items-center justify-between gap-2 rounded-lg border border-zinc-800/80 bg-zinc-900/50 px-3 py-2 text-left text-xs text-zinc-400 transition-colors hover:border-zinc-700 hover:text-zinc-300"
+              aria-expanded={showApiSettings}
+            >
+              <span className="font-medium text-zinc-300">API keys</span>
+              <span className="tabular-nums text-zinc-600">
+                {googleApiKey.trim() || openaiApiKey.trim() ? "configured" : "optional"}
+              </span>
+            </button>
+            {showApiSettings && (
+              <div className="mt-2 space-y-3 rounded-lg border border-zinc-800/80 bg-zinc-900/60 p-3">
+                <p className="text-[11px] leading-relaxed text-zinc-500">
+                  Paste a key from a{" "}
+                  <span className="font-medium text-zinc-400">new AI Studio project</span>{" "}
+                  when quota runs out (a new key in the same project shares the same limit). Saved in
+                  this browser only.
+                </p>
+                <div>
+                  <label
+                    htmlFor="google-api-key"
+                    className="mb-1 block text-[11px] font-medium text-zinc-400"
+                  >
+                    Google AI Studio (Gemini)
+                  </label>
+                  <input
+                    id="google-api-key"
+                    type="password"
+                    autoComplete="off"
+                    value={googleApiKey}
+                    onChange={(e) => setGoogleApiKey(e.target.value)}
+                    placeholder="AIza…"
+                    disabled={loading}
+                    className="w-full rounded-lg border border-zinc-700/80 bg-zinc-950/80 px-2.5 py-2 font-mono text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-emerald-500/40 focus:outline-none focus:ring-2 focus:ring-emerald-500/15 disabled:opacity-60"
+                  />
+                  <a
+                    href="https://aistudio.google.com/apikey"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="mt-1 inline-block text-[10px] text-emerald-600/90 hover:text-emerald-500"
+                  >
+                    Get a free key →
+                  </a>
+                </div>
+                <div>
+                  <label
+                    htmlFor="openai-api-key"
+                    className="mb-1 block text-[11px] font-medium text-zinc-400"
+                  >
+                    OpenAI (fallback)
+                  </label>
+                  <input
+                    id="openai-api-key"
+                    type="password"
+                    autoComplete="off"
+                    value={openaiApiKey}
+                    onChange={(e) => setOpenaiApiKey(e.target.value)}
+                    placeholder="sk-…"
+                    disabled={loading}
+                    className="w-full rounded-lg border border-zinc-700/80 bg-zinc-950/80 px-2.5 py-2 font-mono text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-emerald-500/40 focus:outline-none focus:ring-2 focus:ring-emerald-500/15 disabled:opacity-60"
+                  />
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </header>
 

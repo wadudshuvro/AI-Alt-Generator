@@ -133,13 +133,29 @@ async function sourceToGeminiImagePart(
   }
 }
 
-/** Tried in order so a 429 on one model can succeed on another (separate quotas). */
+/** Tried in order; per-minute 429 may succeed on another model. Daily quota stops after first 429. */
 const GEMINI_MODEL_FALLBACKS = [
   "gemini-2.5-flash-lite",
   "gemini-2.0-flash-lite",
-  "gemini-1.5-flash",
-  "gemini-2.0-flash",
 ] as const;
+
+function gemini429Details(raw: string): {
+  dailyLimit: boolean;
+  retrySeconds?: number;
+} {
+  const dailyLimit =
+    raw.includes("PerDayPerProjectPerModel") || /"limit":\s*0/i.test(raw);
+  const m = raw.match(/retry in ([\d.]+)s/i);
+  return {
+    dailyLimit,
+    retrySeconds: m ? Math.ceil(parseFloat(m[1])) : undefined,
+  };
+}
+
+function keySuffix(key: string): string {
+  const t = key.trim();
+  return t.length >= 4 ? t.slice(-4) : "????";
+}
 
 function geminiModelsToTry(): string[] {
   const preferred = process.env.GEMINI_MODEL?.trim();
@@ -218,8 +234,15 @@ async function generateAltsWithGemini(
       const msg = json.error?.message ?? raw;
       console.error("Gemini API error", model, raw);
       if (code === 429) {
-        lastHint =
-          "Gemini free-tier quota or rate limit hit (429). This app retries other models automatically; if all fail, wait ~1 minute or set billing / another project in Google AI Studio. See https://ai.google.dev/gemini-api/docs/rate-limits";
+        const { dailyLimit, retrySeconds } = gemini429Details(raw);
+        if (dailyLimit) {
+          lastHint =
+            "Gemini daily free-tier limit is exhausted for this API key’s Google Cloud project. A new key in the same project will not help — create a key in a new AI Studio project, wait until tomorrow, or paste an OpenAI key as fallback.";
+          break;
+        }
+        lastHint = retrySeconds
+          ? `Gemini rate limit (429). Wait about ${retrySeconds}s, then try again. Trying another model…`
+          : "Gemini rate limit (429). Wait about a minute, then try again.";
       } else if (code === 403) {
         lastHint =
           "Gemini returned 403 (API not enabled for this key or region). Enable Generative Language API in Google Cloud for the key’s project.";
@@ -263,10 +286,10 @@ async function generateAltsWithGemini(
 
 async function generateAltsWithOpenAI(
   sources: string[],
-  userPrompt: string
+  userPrompt: string,
+  apiKey: string
 ): Promise<string[] | null> {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) return null;
+  if (!apiKey.trim()) return null;
 
   const n = sources.length;
   const instruction =
@@ -323,11 +346,40 @@ async function generateAltsWithOpenAI(
   return parseModelOutputToLines(text, n);
 }
 
-function googleApiKey(): string | undefined {
+function googleApiKeyFromEnv(): string | undefined {
   const k =
     process.env.GOOGLE_AI_API_KEY?.trim() ||
     process.env.GEMINI_API_KEY?.trim();
   return k || undefined;
+}
+
+function trimKey(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const t = value.trim();
+  return t || undefined;
+}
+
+function resolveApiKeys(body: Record<string, unknown>): {
+  geminiKey?: string;
+  openaiKey?: string;
+  geminiKeySource?: "request" | "env";
+  openaiKeySource?: "request" | "env";
+} {
+  const requestGemini =
+    trimKey(body.googleApiKey) ?? trimKey(body.geminiApiKey);
+  const requestOpenai = trimKey(body.openaiApiKey);
+  const envGemini = googleApiKeyFromEnv();
+  const envOpenai = trimKey(process.env.OPENAI_API_KEY);
+
+  const geminiKey = requestGemini ?? envGemini;
+  const openaiKey = requestOpenai ?? envOpenai;
+
+  return {
+    geminiKey,
+    openaiKey,
+    geminiKeySource: requestGemini ? "request" : envGemini ? "env" : undefined,
+    openaiKeySource: requestOpenai ? "request" : envOpenai ? "env" : undefined,
+  };
 }
 
 export async function POST(request: NextRequest) {
@@ -347,8 +399,8 @@ export async function POST(request: NextRequest) {
 
     const { sources, fallbacks } = parsed;
 
-    const geminiKey = googleApiKey();
-    const openaiKey = process.env.OPENAI_API_KEY?.trim();
+    const { geminiKey, openaiKey, geminiKeySource, openaiKeySource } =
+      resolveApiKeys(body);
     const hasAnyKey = Boolean(geminiKey || openaiKey);
 
     let usedAi = false;
@@ -381,7 +433,7 @@ export async function POST(request: NextRequest) {
         if (!usedAi && gh) geminiFailureHint = gh;
       }
       if (!usedAi && openaiKey) {
-        const ai = await generateAltsWithOpenAI(sources, prompt);
+        const ai = await generateAltsWithOpenAI(sources, prompt, openaiKey);
         applyAi(ai, "openai");
       }
     } catch (err) {
@@ -399,7 +451,7 @@ export async function POST(request: NextRequest) {
     const hint = usedAi
       ? undefined
       : !hasAnyKey
-        ? "Vision AI is off: add GOOGLE_AI_API_KEY (Google AI Studio / Gemini) or OPENAI_API_KEY to .env.local, then restart npm run dev."
+        ? "Vision AI is off: paste a Google AI Studio (Gemini) or OpenAI API key in Settings, or add GOOGLE_AI_API_KEY / OPENAI_API_KEY to .env.local."
         : geminiFailureHint ??
           "The model did not return usable lines (check the key, API enablement, billing, and server logs). Showing placeholder text only.";
 
@@ -413,6 +465,9 @@ export async function POST(request: NextRequest) {
       /** True when a vision model produced the alts (Gemini or OpenAI). */
       usedOpenAI: usedAi,
       hint,
+      geminiKeySource,
+      geminiKeySuffix: geminiKey ? keySuffix(geminiKey) : undefined,
+      openaiKeySource,
     });
   } catch (error) {
     console.error("Unhandled error in /api/generate-alt-text:", error);
